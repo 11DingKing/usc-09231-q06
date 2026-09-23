@@ -143,6 +143,164 @@ class TestPlayCount(TestHelper):
         assert self.get_playcount(item.id, "lastfm") == 1
         assert self.get_playcount(item.id, "listenbrainz") == new_count
 
+    def test_album_disambiguates_same_title_recordings(self, log):
+        wanted = self.add_item(
+            title="Song", artist="Artist", album="Wanted Album", play_count=1
+        )
+        other = self.add_item(
+            title="Song", artist="Artist", album="Other Album", play_count=2
+        )
+
+        assert (
+            process_track(
+                self.lib,
+                self.track(album="Wanted Album", playcount=5),
+                log,
+                "lastfm",
+            )
+            is True
+        )
+
+        assert self.get_playcount(wanted.id) == 5
+        assert self.get_playcount(other.id) == 2
+
+    def test_exact_match_wins_over_similar_substring_titles(self, log):
+        exact = self.add_item(title="Song", artist="Artist", play_count=1)
+        similar = self.add_item(
+            title="Song (Live)", artist="Artist", play_count=2
+        )
+
+        assert (
+            process_track(self.lib, self.track(playcount=5), log, "lastfm")
+            is True
+        )
+
+        assert self.get_playcount(exact.id) == 5
+        assert self.get_playcount(similar.id) == 2
+
+    def test_mbid_match_wins_over_similar_substring_titles(self, log):
+        wanted = self.add_item(
+            title="Different Song",
+            artist="Different Artist",
+            mb_trackid="track-id",
+            play_count=1,
+        )
+        similar = self.add_item(
+            title="Song (Live)", artist="Artist", play_count=2
+        )
+
+        assert (
+            process_track(
+                self.lib,
+                self.track(mbid="track-id", playcount=5),
+                log,
+                "lastfm",
+            )
+            is True
+        )
+
+        assert self.get_playcount(wanted.id) == 5
+        assert self.get_playcount(similar.id) == 2
+
+    def test_missing_identifiers_fall_back_to_unique_substring(self, log):
+        item = self.add_item(
+            title="Song (Live)", artist="Artist", play_count=1
+        )
+
+        assert (
+            process_track(self.lib, self.track(playcount=5), log, "lastfm")
+            is True
+        )
+
+        assert self.get_playcount(item.id) == 5
+
+    def test_conflicting_substring_candidates_are_skipped(
+        self, log, caplog
+    ):
+        live = self.add_item(
+            title="Song (Live)", artist="Artist", play_count=1
+        )
+        remix = self.add_item(
+            title="Song (Remix)", artist="Artist", play_count=2
+        )
+
+        with caplog.at_level("DEBUG", logger=LOGGER_NAME):
+            assert (
+                process_track(self.lib, self.track(playcount=5), log, "lastfm")
+                is False
+            )
+
+        assert self.get_playcount(live.id) == 1
+        assert self.get_playcount(remix.id) == 2
+        assert "ambiguous substring match" in caplog.text
+
+    def test_conflicting_substring_candidates_across_albums_are_skipped(
+        self, log, caplog
+    ):
+        live = self.add_item(
+            title="Song (Live)",
+            artist="Artist",
+            album="Live Album",
+            play_count=1,
+        )
+        remix = self.add_item(
+            title="Song (Remix)",
+            artist="Artist",
+            album="Remix Album",
+            play_count=2,
+        )
+
+        with caplog.at_level("DEBUG", logger=LOGGER_NAME):
+            assert (
+                process_track(
+                    self.lib,
+                    # a broad album name contained in both album titles
+                    self.track(album="Album", playcount=5),
+                    log,
+                    "lastfm",
+                )
+                is False
+            )
+
+        assert self.get_playcount(live.id) == 1
+        assert self.get_playcount(remix.id) == 2
+        assert "ambiguous substring match" in caplog.text
+
+    def test_case_difference_still_matches_exactly(self, log):
+        item = self.add_item(
+            title="Song", artist="Artist", album="Album", play_count=1
+        )
+
+        assert (
+            process_track(
+                self.lib,
+                self.track(
+                    artist="ARTIST", name="sOnG", album="aLbUm", playcount=5
+                ),
+                log,
+                "lastfm",
+            )
+            is True
+        )
+
+        assert self.get_playcount(item.id) == 5
+
+    def test_case_difference_does_not_trigger_ambiguous_fallback(self, log):
+        exact = self.add_item(title="Song", artist="Artist", play_count=1)
+        similar = self.add_item(
+            title="Song (Live)", artist="Artist", play_count=2
+        )
+
+        assert (
+            process_track(
+                self.lib, self.track(name="SONG", playcount=5), log, "lastfm"
+            )
+            is True
+        )
+
+        assert self.get_playcount(exact.id) == 5
+        assert self.get_playcount(similar.id) == 2
+
     @pytest.mark.parametrize(
         "tracks, expected_counts, expected_summary, expected_playcount",
         [

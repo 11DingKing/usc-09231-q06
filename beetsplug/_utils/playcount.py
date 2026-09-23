@@ -5,12 +5,13 @@ from typing import TYPE_CHECKING, TypedDict
 from typing_extensions import NotRequired
 
 from beets.dbcore import AndQuery, MatchQuery, OrQuery
-from beets.dbcore.query import SubstringQuery
+from beets.dbcore.query import StringQuery, SubstringQuery
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from beets.dbcore import Query
+    from beets.dbcore.query import StringFieldQuery
     from beets.library import Item, Library
     from beets.logging import BeetsLogger
 
@@ -23,31 +24,117 @@ class Track(TypedDict):
     album: NotRequired[str | None]
 
 
+def _title_query(field_query: type[StringFieldQuery], title: str) -> Query:
+    return OrQuery(
+        [
+            field_query("title", title),
+            # try a right single quotation mark instead of an apostrophe
+            field_query("title", title.replace("'", "’")),
+        ]
+    )
+
+
+def _identity_key(item: Item) -> tuple[str, str]:
+    """Normalized artist/title used to decide whether several items are
+    copies of the same recording rather than conflicting candidates."""
+
+    def normalize(value: object) -> str:
+        return str(value).lower().replace("’", "'")
+
+    return normalize(item.artist), normalize(item.title)
+
+
+def _field_match(
+    lib: Library,
+    field_query: type[StringFieldQuery],
+    artist: str,
+    title: str,
+    album: str,
+) -> list[Item]:
+    """Return items matching the complete fields, trying the most
+    specific combination first so that an album name disambiguates
+    recordings that share an artist and title."""
+    title_query = _title_query(field_query, title)
+
+    # Most specific first: artist + album, then artist, then album alone.
+    candidate_queries: list[Query] = [
+        AndQuery([title_query, field_query("artist", artist)])
+    ]
+    if album:
+        candidate_queries.insert(
+            0,
+            AndQuery(
+                [
+                    title_query,
+                    field_query("artist", artist),
+                    field_query("album", album),
+                ]
+            ),
+        )
+        candidate_queries.append(
+            AndQuery([title_query, field_query("album", album)])
+        )
+
+    for query in candidate_queries:
+        items = list(lib.items(query))
+        if items:
+            return items
+    return []
+
+
+def _resolve_candidates(
+    items: Sequence[Item],
+    log: BeetsLogger,
+    stage: str,
+    artist: str,
+    title: str,
+) -> Sequence[Item]:
+    """Guard against writing a play count to the wrong recording:
+    candidates that differ in artist or title are an ambiguous match.
+    Items sharing the normalized identity (e.g. the same recording on
+    several albums) are all updated together."""
+    identities = {_identity_key(item) for item in items}
+    if len(identities) > 1:
+        candidates = ", ".join(
+            f"{item.artist} - {item.title} ({item.album})" for item in items
+        )
+        log.warning(
+            "ambiguous {} match for {} - {}: conflicting candidates [{}],"
+            " skipping play-count update",
+            stage,
+            artist,
+            title,
+            candidates,
+        )
+        return []
+    return items
+
+
 def get_items(lib: Library, track: Track, log: BeetsLogger) -> Sequence[Item]:
-    mbid, artist, title = track["mbid"], track["artist"], track["name"]
+    mbid = track["mbid"]
+    if mbid:
+        items = list(lib.items(MatchQuery("mb_trackid", mbid)))
+        if items:
+            # The MusicBrainz recording id is authoritative; never let a
+            # fuzzy title match override it.
+            return items
+
+    artist, title = track["artist"], track["name"]
     album = track.get("album") or ""
 
     log.debug("query: {} - {} ({})", artist, title, album)
 
-    title_query = OrQuery(
-        [
-            SubstringQuery("title", title),
-            # try a right single quotation mark instead of an apostrophe
-            SubstringQuery("title", title.replace("'", "\u2019")),
-        ]
-    )
-    or_queries: list[Query] = [
-        AndQuery([SubstringQuery("artist", artist), title_query])
-    ]
-    # First try to query by musicbrainz's trackid
-    if mbid:
-        or_queries.append(MatchQuery("mb_trackid", mbid))
-    if album:
-        or_queries.append(
-            AndQuery([SubstringQuery("album", album), title_query])
-        )
+    # Prefer whole-field, case-insensitive matches; only fall back to a
+    # controlled substring search when no reliable field match exists.
+    for stage, field_query in (
+        ("exact", StringQuery),
+        ("substring", SubstringQuery),
+    ):
+        items = _field_match(lib, field_query, artist, title, album)
+        if items:
+            return _resolve_candidates(items, log, stage, artist, title)
 
-    return list(lib.items(OrQuery(or_queries)))
+    return []
 
 
 def process_track(
