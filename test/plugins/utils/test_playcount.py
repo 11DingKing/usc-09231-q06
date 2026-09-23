@@ -113,6 +113,190 @@ class TestPlayCount(TestHelper):
         assert self.get_playcount(first.id) == 0
         assert self.get_playcount(second.id) == 0
 
+    def test_process_track_prefers_album_when_titles_collide(self, log):
+        # The same song title exists on two different albums and the
+        # imported track names its album: only that copy is updated.
+        on_album_a = self.add_item(
+            title="Song", artist="Artist", album="Album A", play_count=1
+        )
+        on_album_b = self.add_item(
+            title="Song", artist="Artist", album="Album B", play_count=9
+        )
+
+        assert (
+            process_track(
+                self.lib,
+                self.track(album="Album A", playcount=5),
+                log,
+                "lastfm",
+            )
+            is True
+        )
+
+        assert self.get_playcount(on_album_a.id) == 5
+        assert self.get_playcount(on_album_b.id) == 9
+
+    def test_substring_does_not_shadow_mbid(self, log):
+        # A fuzzy title match must not steal the count from the item
+        # identified by the MusicBrainz track ID.
+        mbid_item = self.add_item(
+            title="Song (Live)",
+            artist="Artist",
+            album="Live Album",
+            mb_trackid="mbid-1",
+            play_count=1,
+        )
+        fuzzy_item = self.add_item(
+            title="Song", artist="Artist", album="Album", play_count=9
+        )
+
+        assert (
+            process_track(
+                self.lib,
+                self.track(mbid="mbid-1", name="Song", playcount=5),
+                log,
+                "lastfm",
+            )
+            is True
+        )
+
+        assert self.get_playcount(mbid_item.id) == 5
+        assert self.get_playcount(fuzzy_item.id) == 9
+
+    def test_mbid_match_takes_precedence_over_colliding_titles(self, log):
+        # Even an exact title hit on another item loses to the MBID.
+        target = self.add_item(
+            title="Completely Different Title",
+            artist="Artist",
+            album="Album",
+            mb_trackid="mbid-2",
+            play_count=0,
+        )
+        decoy = self.add_item(
+            title="Song", artist="Artist", album="Album", play_count=0
+        )
+
+        matched = get_items(
+            self.lib, self.track(mbid="mbid-2", playcount=3), log
+        )
+
+        assert [item.id for item in matched] == [target.id]
+        assert decoy.id not in [item.id for item in matched]
+
+    def test_ambiguous_substring_match_is_skipped(self, log, caplog):
+        # No MBID and no exact title: the substring matches two distinct
+        # recordings, so neither may receive the imported count.
+        live = self.add_item(
+            title="Song (Live)", artist="Artist", play_count=1
+        )
+        remix = self.add_item(
+            title="Song (Remix)", artist="Artist", play_count=2
+        )
+
+        with caplog.at_level("DEBUG", logger=LOGGER_NAME):
+            assert (
+                process_track(
+                    self.lib,
+                    self.track(name="Song", playcount=8),
+                    log,
+                    "lastfm",
+                )
+                is False
+            )
+
+        assert self.get_playcount(live.id) == 1
+        assert self.get_playcount(remix.id) == 2
+        assert any("ambiguous" in msg for msg in caplog.messages)
+
+    def test_unique_substring_fallback_still_matches(self, log):
+        # A single fuzzy candidate is an unambiguous enough fallback.
+        item = self.add_item(
+            title="Song (Live)", artist="Artist", play_count=1
+        )
+
+        assert (
+            process_track(
+                self.lib, self.track(name="Song", playcount=4), log, "lastfm"
+            )
+            is True
+        )
+
+        assert self.get_playcount(item.id) == 4
+
+    def test_duplicate_rows_of_same_recording_all_update(self, log):
+        # Rows that are the same recording (identical fields, no MBID)
+        # are not treated as an ambiguous multi-recording conflict.
+        first = self.add_item(
+            title="Song (Live)", artist="Artist", album="Album", play_count=1
+        )
+        second = self.add_item(
+            title="Song (Live)", artist="Artist", album="Album", play_count=2
+        )
+
+        assert (
+            process_track(
+                self.lib, self.track(name="Song", playcount=7), log, "lastfm"
+            )
+            is True
+        )
+
+        assert self.get_playcount(first.id) == 7
+        assert self.get_playcount(second.id) == 7
+
+    def test_missing_identifiers_uses_exact_fields(self, log):
+        # Without an MBID (and without an album) an exact artist/title
+        # match is still a reliable identity.
+        item = self.add_item(
+            title="Song", artist="Artist", album="Album", play_count=0
+        )
+        self.add_item(
+            title="Song (Remix)", artist="Artist", album="Album", play_count=0
+        )
+
+        assert (
+            process_track(
+                self.lib,
+                self.track(mbid="", playcount=6),
+                log,
+                "lastfm",
+            )
+            is True
+        )
+
+        assert self.get_playcount(item.id) == 6
+
+    @pytest.mark.parametrize(
+        "item_kwargs, track_kwargs",
+        [
+            pytest.param(
+                {"title": "Song", "artist": "Artist", "album": "Album"},
+                {"name": "song", "playcount": 1},
+                id="case-insensitive-title",
+            ),
+            pytest.param(
+                {"title": "Song", "artist": "Artist", "album": "Album"},
+                {"artist": "artist", "playcount": 1},
+                id="case-insensitive-artist",
+            ),
+            pytest.param(
+                {"title": "Song", "artist": "Artist", "album": "Album"},
+                {"album": "album", "playcount": 1},
+                id="case-insensitive-album",
+            ),
+        ],
+    )
+    def test_exact_match_is_case_insensitive(
+        self, log, item_kwargs, track_kwargs
+    ):
+        item = self.add_item(**item_kwargs)
+
+        matched_ids = [
+            matched.id
+            for matched in get_items(self.lib, self.track(**track_kwargs), log)
+        ]
+
+        assert matched_ids == [item.id]
+
     def test_process_track_returns_false_when_nothing_matches(self, log):
         assert (
             process_track(
